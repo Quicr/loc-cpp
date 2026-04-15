@@ -1,10 +1,8 @@
 <p align="center">
-  <img src="docs/loc-logo.svg" alt="LOC++ Logo" width="200">
+  <img src="docs/loc-logo.svg" alt="LOC++ Logo" width="280">
+  <br><br>
+  <a href="https://github.com/Quicr/loc-cpp/actions/workflows/ci.yml"><img src="https://github.com/Quicr/loc-cpp/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
 </p>
-
-# loc++
-
-[![CI](https://github.com/Quicr/loc-cpp/actions/workflows/ci.yml/badge.svg)](https://github.com/Quicr/loc-cpp/actions/workflows/ci.yml)
 
 Header-only C++20 implementation of [LOC (Low Overhead Container)](https://github.com/moq-wg/loc) for Media over QUIC.
 
