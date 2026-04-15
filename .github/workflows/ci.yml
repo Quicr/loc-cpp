@@ -10,7 +10,7 @@ on:
 
 jobs:
   build-and-test:
-    name: ${{ matrix.os }} / ${{ matrix.varint }}
+    name: ${{ matrix.os }} / MOQ_VARINT=${{ matrix.moq_varint }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -19,9 +19,9 @@ jobs:
           - ubuntu-latest
           - macos-latest
           - windows-latest
-        varint:
-          - QUIC_VARINT
-          - MOQ_VARINT
+        moq_varint:
+          - OFF
+          - ON
 
     steps:
       - name: Check out repository
@@ -32,7 +32,7 @@ jobs:
           cmake -S . -B build
           -DLOC_BUILD_TESTS=ON
           -DLOC_BUILD_EXAMPLES=ON
-          -DLOC_VARINT_ENCODING=${{ matrix.varint }}
+          -DLOC_USE_MOQ_VARINT=${{ matrix.moq_varint }}
 
       - name: Build
         run: cmake --build build --config Release

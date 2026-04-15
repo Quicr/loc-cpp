@@ -19,7 +19,6 @@ jobs:
       - name: Configure header-only build
         run: >
           cmake -S . -B build-header
-          -DLOC_BUILD_API_ONLY=ON
           -DLOC_BUILD_TESTS=ON
           -DLOC_BUILD_EXAMPLES=ON
 
