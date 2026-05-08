@@ -1,18 +1,17 @@
 # Security Audit Report: LOC C++ Library
 
-**Date:** 2026-05-08 (Updated: 2026-05-08)  
+**Date:** 2026-05-08  
 **Auditor:** Security Review  
-**Scope:** All source files in `include/loc/`, `tests/`, and `examples/`
+**Scope:** All source files in `include/loc/`, `tests/`, and `examples/`  
+**Version:** Post-streaming API additions
 
 ---
 
 ## Executive Summary
 
-This audit examines the LOC (Low Overhead Container) C++ library for memory corruption, information disclosure, and other security vulnerabilities. The library is a header-only implementation for encoding/decoding media metadata containers.
+This audit examines the LOC (Low Overhead Container) C++ library for memory corruption, information disclosure, and other security vulnerabilities. The library is a header-only C++20 implementation for encoding/decoding media metadata containers used in Media over QUIC (MoQ) applications.
 
-Overall, the code demonstrates good security practices with proper bounds checking and error handling.
-
-**Update:** The HIGH and several MEDIUM findings have been addressed. See "Fixed Issues" section below.
+**Overall Assessment:** The codebase demonstrates strong security practices including proper bounds checking, overflow protection, and defensive assertions. The library uses modern C++ features (`std::span`, `std::byte`, RAII) that inherently reduce common vulnerability classes. No critical vulnerabilities were identified.
 
 ---
 
@@ -24,209 +23,311 @@ Overall, the code demonstrates good security practices with proper bounds checki
 
 ## HIGH
 
-*All HIGH issues have been fixed. See "Fixed Issues" section.*
+### H-1: `stream_decoder` Stores Dangling References to Input Buffer
+
+**Location:** `include/loc/loc.hpp:1063-1178`
+
+**Description:** The `stream_decoder` class stores `property_view` objects that contain `byte_span` references pointing into the input buffer passed to `parse_public()` and `parse_payload()`. If the caller frees or modifies the input buffer while the decoder is still in use, all stored property views become dangling references.
+
+```cpp
+expected<void> parse_public(byte_span public_data) noexcept {
+    auto result = decode_properties<Policy>(public_data, [this](const property_view& p) {
+        public_props_.push_back(p);  // Stores span pointing into public_data
+        return true;
+    });
+    // ...
+}
+```
+
+**Impact:** Use-after-free if the input buffer is freed before the decoder. Could lead to information disclosure (reading freed memory) or crashes.
+
+**Recommendation:** 
+1. Document the lifetime requirement prominently in the class documentation
+2. Consider adding a mode that copies property data into owned storage
+3. Consider using `std::shared_ptr` or similar to ensure buffer lifetime
+
+---
+
+### H-2: `buffer_pool` Is Not Thread-Safe
+
+**Location:** `include/loc/loc.hpp:827-856`
+
+**Description:** The `buffer_pool` class uses a `std::vector` for storage without any synchronization primitives. If multiple threads call `acquire()` or `release()` concurrently, data races will occur.
+
+```cpp
+[[nodiscard]] std::vector<byte> acquire() {
+    if (!pool_.empty()) {
+        auto buf = std::move(pool_.back());  // Data race if concurrent access
+        pool_.pop_back();
+        // ...
+    }
+}
+```
+
+**Impact:** Data races leading to undefined behavior, potential memory corruption, or double-free vulnerabilities in multi-threaded media pipelines.
+
+**Recommendation:**
+1. Add mutex protection for thread-safe operation
+2. Or document clearly that each thread must have its own pool instance
+3. Consider providing both thread-safe and single-threaded variants
+
+---
+
+### H-3: Integer Overflow in `media_time` Arithmetic Operations
+
+**Location:** `include/loc/loc.hpp:790-821`
+
+**Description:** The `media_time` conversion functions perform multiplication before division without overflow checking:
+
+```cpp
+[[nodiscard]] static constexpr media_time from_us(std::uint64_t microseconds, std::uint64_t scale = 1'000'000) noexcept {
+    return {microseconds * scale / 1'000'000, scale};  // Overflow if microseconds * scale > 2^64
+}
+
+[[nodiscard]] constexpr std::uint64_t to_us() const noexcept {
+    return ticks * 1'000'000 / timescale;  // Overflow possible
+}
+
+[[nodiscard]] constexpr media_time convert_to(std::uint64_t new_scale) const noexcept {
+    return {ticks * new_scale / timescale, new_scale};  // Overflow possible
+}
+```
+
+**Impact:** With large timestamp values (common in long-running streams), multiplication overflow causes incorrect timestamps. For a 90kHz video at ~5.7 hours, `ticks * 1'000'000` overflows uint64.
+
+**Recommendation:** Use 128-bit intermediate arithmetic or reorder operations:
+```cpp
+return {microseconds / 1'000'000 * scale + (microseconds % 1'000'000) * scale / 1'000'000, scale};
+```
 
 ---
 
 ## MEDIUM
 
-### M-1: Potential Memory Leak on Exception in `property` Copy Constructor
+### M-1: Assertions Used for Runtime Validation in Release Builds
 
-**Status:** Open (Low Risk)
+**Location:** Multiple locations including `loc.hpp:72-105`, `300-302`, `375`, `534`, `1048`
 
-**Location:** `include/loc/loc.hpp:396-403`
-
-**Description:** The copy constructor allocates memory before copying:
+**Description:** The code uses `assert()` for validation that should occur at runtime. In release builds (with `NDEBUG` defined), these checks are removed, potentially allowing undefined behavior.
 
 ```cpp
-property(const property& other) : id_(other.id_), is_varint_(other.is_varint_), size_(other.size_) {
-    if (size_ <= sbo_size) {
-        storage_.inline_data = other.storage_.inline_data;
-    } else {
-        storage_.heap_data = new byte[size_];  // May throw
-        std::copy_n(other.storage_.heap_data, size_, storage_.heap_data);
+constexpr void advance(std::size_t n) noexcept {
+    assert(n <= data_.size() && "advance beyond end of cursor");  // Gone in release
+    data_ = data_.subspan(n);  // UB if n > size in release
+}
+```
+
+**Impact:** Security checks are bypassed in release builds. Malicious input could trigger undefined behavior that was protected in debug builds.
+
+**Recommendation:** Replace security-critical assertions with runtime checks that remain in release builds:
+```cpp
+if (n > data_.size()) std::terminate();  // Or throw, or return error
+```
+
+---
+
+### M-2: Potential Memory Exhaustion via Large Property Length
+
+**Location:** `include/loc/loc.hpp:556-559`
+
+**Description:** When decoding byte properties, the length is read as a varint and then used to read that many bytes:
+
+```cpp
+auto len_result = c.read_varint<Policy>();
+if (!len_result) return len_result.error();
+auto bytes_result = c.read_bytes(*len_result);  // len_result could be huge
+```
+
+While `read_bytes` checks bounds against the input buffer, a malicious encoder could craft input that causes `collect_properties` to allocate a large vector of `property_view` objects by including many small properties.
+
+**Impact:** Memory exhaustion denial of service by crafting input with millions of tiny properties.
+
+**Recommendation:** Add configurable limits on:
+1. Maximum number of properties per decode operation
+2. Maximum total decoded size
+
+---
+
+### M-3: `encoded_result` Destructor May Access Invalid Pool Pointer
+
+**Location:** `include/loc/loc.hpp:948-989`
+
+**Description:** The `encoded_result` stores a raw pointer to a `buffer_pool`. If the pool is destroyed before the `encoded_result`, the destructor will call methods on a dangling pointer.
+
+```cpp
+~encoded_result() { release(); }
+
+void release() {
+    if (pool) {
+        pool->release(std::move(public_properties));  // pool may be dangling
+        // ...
     }
 }
 ```
 
-If `new` throws `std::bad_alloc`, the object is left in a partially constructed state. While the destructor won't run for a failed constructor, the member initializers have already executed.
+**Impact:** Use-after-free when pool is destroyed before encoded results. Could cause crashes or memory corruption.
 
-**Impact:** In low-memory conditions, could lead to unexpected behavior. The `noexcept` specification is not present, so callers expecting exceptions should be prepared.
-
-**Recommendation:** Consider using `std::make_unique` or a two-phase initialization to ensure exception safety, or mark as `noexcept` with appropriate handling.
+**Recommendation:** Use `std::weak_ptr` or document lifetime requirements clearly. Consider having `encoded_result` not automatically release to pool on destruction.
 
 ---
 
-### M-5: Union with Non-Trivial Member Risks
+### M-4: No Maximum Recursion/Nesting Depth for Property Parsing
 
-**Status:** Open (Low Risk)
+**Location:** `include/loc/loc.hpp:540-568`
 
-**Location:** `include/loc/loc.hpp:465-468`
+**Description:** The property decoding doesn't limit the complexity of input. While not directly recursive, deeply nested or malformed data structures could consume excessive stack or heap.
 
-**Description:** The `Storage` union contains both an array and a raw pointer. The pattern is error-prone but currently correctly implemented. The move constructor copies the raw union bytes and properly tracks ownership via `size_`.
+**Impact:** Stack exhaustion or excessive memory use with crafted input.
 
-**Impact:** Future maintenance risk. If `size_` is not properly maintained, the destructor could attempt to delete inline data or read uninitialized pointer.
+**Recommendation:** Add depth/count limits to parsing operations.
 
-**Recommendation:** Consider using `std::variant` or a tagged union pattern with explicit active member tracking for future refactoring.
+---
+
+### M-5: Potential Division by Zero in `media_time`
+
+**Location:** `include/loc/loc.hpp:810-819`
+
+**Description:** The `media_time` struct initializes `timescale` to 1, but there's no enforcement preventing it from being set to 0:
+
+```cpp
+struct media_time {
+    std::uint64_t ticks{0};
+    std::uint64_t timescale{1};
+    
+    [[nodiscard]] constexpr std::uint64_t to_us() const noexcept {
+        return ticks * 1'000'000 / timescale;  // Division by zero if timescale == 0
+    }
+```
+
+**Impact:** Undefined behavior (typically crash) if timescale is 0.
+
+**Recommendation:** Add validation or use a safe division helper that handles zero.
 
 ---
 
 ## LOW
 
-### L-1: Missing `noexcept` Verification
+### L-1: `to_hex` and `from_hex` Allocate Without Size Limits
 
-**Status:** Open
+**Location:** `include/loc/loc.hpp:752-784`
 
-Move operations are marked `noexcept` which is correct and verified by inspection. No action needed.
+**Description:** These utility functions allocate based on input size without limits. `to_hex` doubles the size, `from_hex` allocates half.
 
----
+**Impact:** Large inputs could cause allocation failure. Low severity as these are utility functions.
 
-### L-2: `to_hex` and `from_hex` Use Heap Allocation
-
-**Status:** Open
-
-These utility functions allocate memory and could throw `std::bad_alloc`. They're not marked `noexcept` (correctly), but callers processing untrusted input should be aware of potential allocation failures with large input.
+**Recommendation:** Document maximum expected sizes or add optional limits.
 
 ---
 
-### L-3: `errc` Enum Switch Coverage
+### L-2: Missing `[[nodiscard]]` on Some Error-Returning Functions
 
-**Status:** Open
+**Location:** Various
 
-The `to_string(errc)` function has all cases covered plus a fallback. This is defensive and correct.
+**Description:** Some functions that return `expected<void>` or error indicators should have `[[nodiscard]]` to prevent silently ignored errors.
 
----
+**Impact:** Errors might be silently ignored, leading to incorrect program state.
 
-### L-4: Fuzz Test Distribution Bias
-
-**Status:** Open
-
-The fuzzer uses modulo to determine split points, which biases toward smaller values. Consider alternative distributions for better coverage.
+**Recommendation:** Add `[[nodiscard]]` consistently to all error-returning functions.
 
 ---
 
-### L-5: Benchmark Uses Compiler-Specific Features
+### L-3: Property ID Convention Not Enforced at Construction
 
-**Status:** Improved
+**Location:** `include/loc/loc.hpp:368-398`
 
-The benchmark now uses a portable `do_not_optimize()` helper with fallback for non-GCC/Clang compilers.
+**Description:** The even/odd ID convention for varint/bytes properties is only checked at encoding time, not at property construction:
 
----
-
-### L-6: Property ID Convention Documentation
-
-**Status:** Open
-
-The even/odd convention for varint vs bytes properties is implicit. Consider documenting prominently.
-
----
-
-## Fixed Issues
-
-### H-1: Undefined Behavior in `expected<T>` When Accessing Error State ✓ FIXED
-
-**Fix:** Added `assert()` calls to all accessor methods (`operator*`, `operator->`, `value()`) that verify `has_value()` before returning. In debug builds, accessing an error state now triggers an assertion failure with a descriptive message.
-
----
-
-### H-2: Integer Overflow in `moq_varint::decode` Shift Operation ✓ FIXED
-
-**Fix:** Tightened the overflow check to prevent undefined behavior:
 ```cpp
-// Check for overflow before shifting: at shift=63, only bit 0 can be set
-if (shift >= 63 && payload > 1) return errc::overflow;
-```
-Also changed the loop termination to check `i >= 9` instead of `shift > 63` for clarity.
-
----
-
-### H-3: Unchecked Result in `property::from_varint` ✓ FIXED
-
-**Fix:** Added assertion before dereferencing:
-```cpp
-auto result = default_varint::encode(value, buf);
-assert(result.has_value() && "varint encoding failed");
-p.size_ = *result;
+// This silently creates an invalid property (odd ID for varint)
+auto bad = loc::property::from_varint(13, 42);  // ID 13 is odd (bytes type)
+// Error only detected at encode time
 ```
 
----
+**Impact:** Runtime errors that could be caught earlier at construction.
 
-### M-2: `cursor::advance()` Has No Bounds Check ✓ FIXED
-
-**Fix:** Added bounds check assertion:
-```cpp
-constexpr void advance(std::size_t n) noexcept {
-    assert(n <= data_.size() && "advance beyond end of cursor");
-    data_ = data_.subspan(n);
-}
-```
+**Recommendation:** Consider validating ID/type consistency at construction time.
 
 ---
 
-### M-3: `encode_properties` Unconditionally Dereferences Result ✓ FIXED
+### L-4: Fuzz Test Coverage Could Be Expanded
 
-**Fix:** Added assertion in the encoding loop:
-```cpp
-auto result = encode_property<Policy>(p, mutable_byte_span{out}.subspan(offset));
-assert(result.has_value() && "property encoding failed");
-offset += *result;
-```
+**Location:** `tests/fuzz/`
+
+**Description:** The fuzzing targets cover varint, properties, and LOC objects, but don't cover:
+- `stream_encoder` / `stream_decoder`
+- `media_time` operations
+- `buffer_pool` operations
+- `media_frame` construction
+
+**Impact:** Potential bugs in newer components not discovered by fuzzing.
+
+**Recommendation:** Add fuzz targets for new streaming API components.
 
 ---
 
-### M-4: No Validation of Bitfield Values in Decode Functions ✓ FIXED
+### L-5: No Constant-Time Comparison for Sensitive Data
 
-**Fix:** Changed `video_frame_marking::decode` and `audio_level::decode` to return `std::optional` and validate that unused bits are zero:
+**Location:** N/A
+
+**Description:** The library doesn't handle secrets, but if used in contexts where property values are sensitive, the lack of constant-time comparison could leak information.
+
+**Impact:** Timing side-channels if used with sensitive data. Low severity as this is a media container library.
+
+**Recommendation:** Document that the library is not designed for cryptographic or secret data handling.
+
+---
+
+### L-6: Bitfield Layout Is Implementation-Defined
+
+**Location:** `include/loc/loc.hpp:585-590`, `617-619`
+
+**Description:** The `video_frame_marking` and `audio_level` structs use bitfields:
+
 ```cpp
-[[nodiscard]] static constexpr std::optional<video_frame_marking> decode(std::uint64_t v) noexcept {
-    if (v & ~0x1FFULL) return std::nullopt;  // Invalid bits set
+struct video_frame_marking {
+    bool independent : 1 {false};
+    bool discardable : 1 {false};
     // ...
-}
+};
 ```
 
----
+Bitfield layout is implementation-defined in C++. While the encode/decode functions don't rely on the memory layout, the struct size might vary.
 
-## New Components Security Notes
+**Impact:** No direct security impact as serialization is explicit. Minor portability concern.
 
-The following components were added after the initial audit:
-
-### `buffer_pool`
-- Thread safety: NOT thread-safe. Document that each thread should have its own pool, or add external synchronization.
-- No memory limits: Pool can grow unbounded if buffers aren't released. The `max_pool_size_` setting only limits reuse, not total allocation.
-
-### `stream_encoder` / `stream_decoder`
-- Uses the same bounds-checked primitives as the core library.
-- `stream_decoder` stores `property_view` references into the input buffer - callers must ensure the input buffer outlives the decoder.
-
-### `media_frame`
-- High-level wrapper that delegates to safe primitives.
-- No additional security concerns.
-
-### `group_info`
-- Simple POD structure with no security implications.
+**Recommendation:** No action needed; the explicit encode/decode functions handle serialization correctly.
 
 ---
 
 ## Positive Security Observations
 
-1. **Good bounds checking**: The varint decoders properly check for truncated input and overflow
-2. **Non-minimal encoding rejection**: Both QUIC and MOQ varint decoders reject non-minimal encodings, preventing length-extension attacks
-3. **Fuzzing infrastructure**: The project includes fuzzing targets for critical parsing code
-4. **No raw pointer arithmetic**: The code uses `std::span` throughout, reducing pointer arithmetic errors
-5. **Constexpr where possible**: Many functions are constexpr, enabling compile-time verification
-6. **RAII for memory management**: The `property` class properly manages heap memory with copy/move semantics
-7. **Defensive assertions**: Debug builds now catch common misuse patterns
+1. **Proper bounds checking**: All buffer accesses use `std::span` with bounds-checked operations
+2. **Overflow protection**: Varint decoders properly check for integer overflow before shifting
+3. **Non-minimal encoding rejection**: Both QUIC and MOQ varint decoders reject non-canonical encodings
+4. **RAII memory management**: `property` class properly manages heap allocations
+5. **Defensive assertions**: Debug builds catch common programming errors
+6. **Fuzzing infrastructure**: Project includes fuzz targets for critical parsing code
+7. **No raw pointer arithmetic**: Modern C++ containers and spans used throughout
+8. **Explicit error handling**: `expected<T>` type forces callers to handle errors
 
 ---
 
-## Recommendations for Future Development
+## Recommendations Summary
 
-1. **Add static analysis**: Integrate clang-tidy or similar tools into CI
-2. **Add sanitizer runs**: Ensure ASan/UBSan/MSan are run in CI, not just for fuzzing
-3. **Consider std::expected**: C++23's `std::expected` provides a more robust error-handling type
-4. **Document thread safety**: Clarify which components are thread-safe
-5. **Add integer overflow tests**: Explicitly test boundary conditions for all varint sizes
-6. **Document lifetime requirements**: `stream_decoder` holds views into input buffers
+### Immediate Actions (Before Production Use)
+1. Document `stream_decoder` lifetime requirements prominently
+2. Document `buffer_pool` thread-safety limitations
+3. Fix integer overflow in `media_time` arithmetic
+
+### Short-Term Improvements
+1. Add runtime checks (not just assertions) for security-critical validations
+2. Add limits to property parsing to prevent resource exhaustion
+3. Fix potential division by zero in `media_time`
+
+### Long-Term Improvements
+1. Add thread-safe `buffer_pool` variant
+2. Expand fuzz testing to cover streaming API
+3. Consider `std::expected` (C++23) migration for better error handling
 
 ---
 
