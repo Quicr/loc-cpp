@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -43,7 +44,9 @@ enum class errc : std::uint8_t {
     overflow,
     invalid_encoding,
     non_minimal,
-    type_mismatch
+    type_mismatch,
+    limit_exceeded,
+    invalid_argument
 };
 
 [[nodiscard]] constexpr std::string_view to_string(errc e) noexcept {
@@ -54,9 +57,31 @@ enum class errc : std::uint8_t {
         case errc::invalid_encoding: return "invalid encoding";
         case errc::non_minimal: return "non-minimal encoding";
         case errc::type_mismatch: return "property type mismatch";
+        case errc::limit_exceeded: return "limit exceeded";
+        case errc::invalid_argument: return "invalid argument";
     }
     return "unknown error";
 }
+
+// ============================================================================
+// Configuration Limits
+// ============================================================================
+
+struct decode_limits {
+    std::size_t max_properties{10000};
+    std::size_t max_property_size{16 * 1024 * 1024};  // 16 MB
+    std::size_t max_total_size{64 * 1024 * 1024};     // 64 MB
+
+    static constexpr decode_limits none() noexcept {
+        return {std::numeric_limits<std::size_t>::max(),
+                std::numeric_limits<std::size_t>::max(),
+                std::numeric_limits<std::size_t>::max()};
+    }
+
+    static constexpr decode_limits strict() noexcept {
+        return {1000, 1024 * 1024, 4 * 1024 * 1024};
+    }
+};
 
 template <typename T>
 class [[nodiscard]] expected {
@@ -297,9 +322,10 @@ public:
     [[nodiscard]] constexpr std::size_t size() const noexcept { return data_.size(); }
     [[nodiscard]] constexpr bool empty() const noexcept { return data_.empty(); }
 
-    constexpr void advance(std::size_t n) noexcept {
-        assert(n <= data_.size() && "advance beyond end of cursor");
+    constexpr bool advance(std::size_t n) noexcept {
+        if (n > data_.size()) return false;
         data_ = data_.subspan(n);
+        return true;
     }
 
     template <typename Policy = default_varint>
@@ -538,10 +564,19 @@ template <typename Policy = default_varint>
 }
 
 template <typename Policy = default_varint, typename Visitor>
-[[nodiscard]] inline expected<void> decode_properties(byte_span in, Visitor&& visitor) noexcept {
+[[nodiscard]] inline expected<void> decode_properties(
+    byte_span in,
+    Visitor&& visitor,
+    const decode_limits& limits = {}) noexcept {
+
     cursor c(in);
+    std::size_t property_count = 0;
 
     while (!c.empty()) {
+        if (++property_count > limits.max_properties) {
+            return errc::limit_exceeded;
+        }
+
         auto id_result = c.read_varint<Policy>();
         if (!id_result) return id_result.error();
         auto id = *id_result;
@@ -555,6 +590,11 @@ template <typename Policy = default_varint, typename Visitor>
         } else {
             auto len_result = c.read_varint<Policy>();
             if (!len_result) return len_result.error();
+
+            if (*len_result > limits.max_property_size) {
+                return errc::limit_exceeded;
+            }
+
             auto bytes_result = c.read_bytes(*len_result);
             if (!bytes_result) return bytes_result.error();
             value_data = *bytes_result;
@@ -568,12 +608,15 @@ template <typename Policy = default_varint, typename Visitor>
 }
 
 template <typename Policy = default_varint>
-[[nodiscard]] inline expected<std::vector<property_view>> collect_properties(byte_span in) noexcept {
+[[nodiscard]] inline expected<std::vector<property_view>> collect_properties(
+    byte_span in,
+    const decode_limits& limits = {}) noexcept {
+
     std::vector<property_view> props;
     auto result = decode_properties<Policy>(in, [&](const property_view& p) {
         props.push_back(p);
         return true;
-    });
+    }, limits);
     if (!result) return result.error();
     return props;
 }
@@ -791,12 +834,27 @@ struct media_time {
     std::uint64_t ticks{0};
     std::uint64_t timescale{1};
 
+    // Overflow-safe multiplication: (a * b) / c without overflow
+    [[nodiscard]] static constexpr std::uint64_t safe_scale(std::uint64_t value, std::uint64_t mul, std::uint64_t div) noexcept {
+        if (div == 0) return 0;
+        // Use 128-bit arithmetic via compiler builtins or split multiplication
+        #if defined(__SIZEOF_INT128__)
+        __uint128_t result = static_cast<__uint128_t>(value) * mul / div;
+        return static_cast<std::uint64_t>(result);
+        #else
+        // Fallback: split into high and low parts to avoid overflow
+        std::uint64_t high = value / div;
+        std::uint64_t low = value % div;
+        return high * mul + (low * mul) / div;
+        #endif
+    }
+
     [[nodiscard]] static constexpr media_time from_us(std::uint64_t microseconds, std::uint64_t scale = 1'000'000) noexcept {
-        return {microseconds * scale / 1'000'000, scale};
+        return {safe_scale(microseconds, scale, 1'000'000), scale};
     }
 
     [[nodiscard]] static constexpr media_time from_ms(std::uint64_t milliseconds, std::uint64_t scale = 1'000) noexcept {
-        return {milliseconds * scale / 1'000, scale};
+        return {safe_scale(milliseconds, scale, 1'000), scale};
     }
 
     [[nodiscard]] static constexpr media_time from_90khz(std::uint64_t ticks_90k) noexcept {
@@ -808,15 +866,22 @@ struct media_time {
     }
 
     [[nodiscard]] constexpr std::uint64_t to_us() const noexcept {
-        return ticks * 1'000'000 / timescale;
+        if (timescale == 0) return 0;
+        return safe_scale(ticks, 1'000'000, timescale);
     }
 
     [[nodiscard]] constexpr std::uint64_t to_ms() const noexcept {
-        return ticks * 1'000 / timescale;
+        if (timescale == 0) return 0;
+        return safe_scale(ticks, 1'000, timescale);
     }
 
     [[nodiscard]] constexpr media_time convert_to(std::uint64_t new_scale) const noexcept {
-        return {ticks * new_scale / timescale, new_scale};
+        if (timescale == 0) return {0, new_scale};
+        return {safe_scale(ticks, new_scale, timescale), new_scale};
+    }
+
+    [[nodiscard]] constexpr bool is_valid() const noexcept {
+        return timescale > 0;
     }
 };
 
@@ -824,9 +889,58 @@ struct media_time {
 // Buffer Pool for High-Throughput Encoding
 // ============================================================================
 
+// Thread-safe buffer pool for high-throughput encoding
 class buffer_pool {
 public:
     explicit buffer_pool(std::size_t initial_capacity = 4096) : default_capacity_(initial_capacity) {}
+
+    // Non-copyable, non-movable (due to mutex)
+    buffer_pool(const buffer_pool&) = delete;
+    buffer_pool& operator=(const buffer_pool&) = delete;
+    buffer_pool(buffer_pool&&) = delete;
+    buffer_pool& operator=(buffer_pool&&) = delete;
+
+    [[nodiscard]] std::vector<byte> acquire() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!pool_.empty()) {
+            auto buf = std::move(pool_.back());
+            pool_.pop_back();
+            buf.clear();
+            return buf;
+        }
+        std::vector<byte> buf;
+        buf.reserve(default_capacity_);
+        return buf;
+    }
+
+    void release(std::vector<byte> buf) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (pool_.size() < max_pool_size_) {
+            pool_.push_back(std::move(buf));
+        }
+    }
+
+    void set_max_pool_size(std::size_t max_size) noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        max_pool_size_ = max_size;
+    }
+
+    [[nodiscard]] std::size_t pool_size() const noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return pool_.size();
+    }
+
+private:
+    mutable std::mutex mutex_;
+    std::vector<std::vector<byte>> pool_;
+    std::size_t default_capacity_;
+    std::size_t max_pool_size_{32};
+};
+
+// Single-threaded buffer pool (no locking overhead)
+class buffer_pool_st {
+public:
+    explicit buffer_pool_st(std::size_t initial_capacity = 4096) : default_capacity_(initial_capacity) {}
 
     [[nodiscard]] std::vector<byte> acquire() {
         if (!pool_.empty()) {
@@ -948,7 +1062,6 @@ public:
     struct encoded_result {
         std::vector<byte> public_properties;
         std::vector<byte> payload;
-        buffer_pool* pool{nullptr};
 
         [[nodiscard]] byte_span public_view() const noexcept {
             return {public_properties.data(), public_properties.size()};
@@ -958,39 +1071,24 @@ public:
             return {payload.data(), payload.size()};
         }
 
-        void release() {
-            if (pool) {
-                pool->release(std::move(public_properties));
-                pool->release(std::move(payload));
-                pool = nullptr;
-            }
+        // Manually release buffers back to a pool
+        void release_to(buffer_pool& pool) {
+            pool.release(std::move(public_properties));
+            pool.release(std::move(payload));
+            public_properties = {};
+            payload = {};
         }
 
-        ~encoded_result() { release(); }
-        encoded_result() = default;
-        encoded_result(encoded_result&& other) noexcept
-            : public_properties(std::move(other.public_properties))
-            , payload(std::move(other.payload))
-            , pool(other.pool) {
-            other.pool = nullptr;
+        void release_to(buffer_pool_st& pool) {
+            pool.release(std::move(public_properties));
+            pool.release(std::move(payload));
+            public_properties = {};
+            payload = {};
         }
-        encoded_result& operator=(encoded_result&& other) noexcept {
-            if (this != &other) {
-                release();
-                public_properties = std::move(other.public_properties);
-                payload = std::move(other.payload);
-                pool = other.pool;
-                other.pool = nullptr;
-            }
-            return *this;
-        }
-        encoded_result(const encoded_result&) = delete;
-        encoded_result& operator=(const encoded_result&) = delete;
     };
 
     [[nodiscard]] encoded_result encode() {
         encoded_result result;
-        result.pool = pool_;
 
         result.public_properties = pool_ ? pool_->acquire() : std::vector<byte>{};
         result.payload = pool_ ? pool_->acquire() : std::vector<byte>{};
@@ -1001,6 +1099,9 @@ public:
 
         return result;
     }
+
+    // Get pool pointer for manual release
+    [[nodiscard]] buffer_pool* pool() const noexcept { return pool_; }
 
     [[nodiscard]] expected<std::size_t> encode_public_into(mutable_byte_span out) const noexcept {
         std::size_t offset = 0;
@@ -1060,30 +1161,50 @@ private:
 // Streaming Decoder (Incremental Parsing)
 // ============================================================================
 
+// Owning property - stores a copy of property data
+struct owned_property {
+    std::uint64_t id{0};
+    std::vector<byte> data{};
+
+    [[nodiscard]] bool is_varint() const noexcept { return is_varint_property(id); }
+
+    [[nodiscard]] property_view view() const noexcept {
+        return {id, byte_span{data.data(), data.size()}};
+    }
+
+    template <typename Policy = default_varint>
+    [[nodiscard]] expected<std::uint64_t> as_varint() const noexcept {
+        return view().template as_varint<Policy>();
+    }
+};
+
 template <typename Policy = default_varint>
 class stream_decoder {
 public:
     enum class state { need_header, have_header, complete, error };
 
-    stream_decoder() = default;
+    explicit stream_decoder(const decode_limits& limits = {}) : limits_(limits) {}
 
     void reset() noexcept {
         state_ = state::need_header;
         error_ = errc::ok;
         public_props_.clear();
         private_props_.clear();
-        payload_data_ = {};
-        private_length_ = 0;
+        payload_data_.clear();
     }
 
     [[nodiscard]] state current_state() const noexcept { return state_; }
     [[nodiscard]] errc last_error() const noexcept { return error_; }
 
-    expected<void> parse_public(byte_span public_data) noexcept {
+    // Parse public properties - copies data internally
+    [[nodiscard]] expected<void> parse_public(byte_span public_data) noexcept {
         auto result = decode_properties<Policy>(public_data, [this](const property_view& p) {
-            public_props_.push_back(p);
+            owned_property owned;
+            owned.id = p.id;
+            owned.data.assign(p.data.begin(), p.data.end());
+            public_props_.push_back(std::move(owned));
             return true;
-        });
+        }, limits_);
         if (!result) {
             state_ = state::error;
             error_ = result.error();
@@ -1093,21 +1214,27 @@ public:
         return {};
     }
 
-    expected<void> parse_payload(byte_span payload_with_private, std::size_t private_length) noexcept {
+    // Parse payload - copies data internally
+    [[nodiscard]] expected<void> parse_payload(byte_span payload_with_private, std::size_t private_length) noexcept {
         if (payload_with_private.size() < private_length) {
             state_ = state::error;
             error_ = errc::truncated;
             return error_;
         }
 
-        private_length_ = private_length;
         auto private_data = payload_with_private.first(private_length);
-        payload_data_ = payload_with_private.subspan(private_length);
+        auto payload_span = payload_with_private.subspan(private_length);
+
+        // Copy payload data
+        payload_data_.assign(payload_span.begin(), payload_span.end());
 
         auto result = decode_properties<Policy>(private_data, [this](const property_view& p) {
-            private_props_.push_back(p);
+            owned_property owned;
+            owned.id = p.id;
+            owned.data.assign(p.data.begin(), p.data.end());
+            private_props_.push_back(std::move(owned));
             return true;
-        });
+        }, limits_);
         if (!result) {
             state_ = state::error;
             error_ = result.error();
@@ -1118,16 +1245,16 @@ public:
         return {};
     }
 
-    [[nodiscard]] std::span<const property_view> public_properties() const noexcept {
+    [[nodiscard]] std::span<const owned_property> public_properties() const noexcept {
         return public_props_;
     }
 
-    [[nodiscard]] std::span<const property_view> private_properties() const noexcept {
+    [[nodiscard]] std::span<const owned_property> private_properties() const noexcept {
         return private_props_;
     }
 
     [[nodiscard]] byte_span payload() const noexcept {
-        return payload_data_;
+        return {payload_data_.data(), payload_data_.size()};
     }
 
     [[nodiscard]] std::optional<std::uint64_t> get_timestamp() const noexcept {
@@ -1169,12 +1296,12 @@ private:
         return std::nullopt;
     }
 
+    decode_limits limits_;
     state state_{state::need_header};
     errc error_{errc::ok};
-    std::vector<property_view> public_props_;
-    std::vector<property_view> private_props_;
-    byte_span payload_data_;
-    std::size_t private_length_{0};
+    std::vector<owned_property> public_props_;
+    std::vector<owned_property> private_props_;
+    std::vector<byte> payload_data_;
 };
 
 // ============================================================================

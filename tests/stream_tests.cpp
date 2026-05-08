@@ -110,8 +110,10 @@ TEST_CASE("stream_encoder with buffer pool") {
     {
         auto result = encoder.encode();
         CHECK_FALSE(result.public_view().empty());
+        // Explicitly release buffers back to pool
+        result.release_to(pool);
     }
-    // Buffer should be returned to pool on destruction
+    // Buffer should be returned to pool after explicit release
     CHECK_EQ(pool.pool_size(), 2U);
 }
 
