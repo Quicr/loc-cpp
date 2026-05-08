@@ -330,7 +330,12 @@ namespace property_id {
     inline constexpr std::uint64_t timestamp = 6;
     inline constexpr std::uint64_t timescale = 8;
     inline constexpr std::uint64_t audio_level = 10;
+    inline constexpr std::uint64_t sequence_number = 12;
     inline constexpr std::uint64_t video_config = 13;
+    inline constexpr std::uint64_t group_id = 14;
+    inline constexpr std::uint64_t subgroup_id = 16;
+    inline constexpr std::uint64_t priority = 18;
+    inline constexpr std::uint64_t delivery_timeout = 20;
 }
 
 [[nodiscard]] constexpr bool is_varint_property(std::uint64_t id) noexcept {
@@ -777,5 +782,488 @@ template <typename Policy = default_varint>
     }
     return result;
 }
+
+// ============================================================================
+// Timestamp Utilities
+// ============================================================================
+
+struct media_time {
+    std::uint64_t ticks{0};
+    std::uint64_t timescale{1};
+
+    [[nodiscard]] static constexpr media_time from_us(std::uint64_t microseconds, std::uint64_t scale = 1'000'000) noexcept {
+        return {microseconds * scale / 1'000'000, scale};
+    }
+
+    [[nodiscard]] static constexpr media_time from_ms(std::uint64_t milliseconds, std::uint64_t scale = 1'000) noexcept {
+        return {milliseconds * scale / 1'000, scale};
+    }
+
+    [[nodiscard]] static constexpr media_time from_90khz(std::uint64_t ticks_90k) noexcept {
+        return {ticks_90k, 90'000};
+    }
+
+    [[nodiscard]] static constexpr media_time from_48khz(std::uint64_t samples) noexcept {
+        return {samples, 48'000};
+    }
+
+    [[nodiscard]] constexpr std::uint64_t to_us() const noexcept {
+        return ticks * 1'000'000 / timescale;
+    }
+
+    [[nodiscard]] constexpr std::uint64_t to_ms() const noexcept {
+        return ticks * 1'000 / timescale;
+    }
+
+    [[nodiscard]] constexpr media_time convert_to(std::uint64_t new_scale) const noexcept {
+        return {ticks * new_scale / timescale, new_scale};
+    }
+};
+
+// ============================================================================
+// Buffer Pool for High-Throughput Encoding
+// ============================================================================
+
+class buffer_pool {
+public:
+    explicit buffer_pool(std::size_t initial_capacity = 4096) : default_capacity_(initial_capacity) {}
+
+    [[nodiscard]] std::vector<byte> acquire() {
+        if (!pool_.empty()) {
+            auto buf = std::move(pool_.back());
+            pool_.pop_back();
+            buf.clear();
+            return buf;
+        }
+        std::vector<byte> buf;
+        buf.reserve(default_capacity_);
+        return buf;
+    }
+
+    void release(std::vector<byte> buf) {
+        if (pool_.size() < max_pool_size_) {
+            pool_.push_back(std::move(buf));
+        }
+    }
+
+    void set_max_pool_size(std::size_t max_size) noexcept { max_pool_size_ = max_size; }
+    [[nodiscard]] std::size_t pool_size() const noexcept { return pool_.size(); }
+
+private:
+    std::vector<std::vector<byte>> pool_;
+    std::size_t default_capacity_;
+    std::size_t max_pool_size_{32};
+};
+
+// ============================================================================
+// Group/Sequence Metadata (LOC draft concepts)
+// ============================================================================
+
+struct group_info {
+    std::uint64_t group_id{0};
+    std::uint64_t subgroup_id{0};
+    std::uint64_t sequence{0};
+    std::uint8_t priority{0};
+    std::optional<std::uint64_t> delivery_timeout_ms{};
+};
+
+// ============================================================================
+// Streaming Encoder (Reuses Buffers)
+// ============================================================================
+
+template <typename Policy = default_varint>
+class stream_encoder {
+public:
+    explicit stream_encoder(buffer_pool* pool = nullptr) : pool_(pool) {}
+
+    stream_encoder& reset() {
+        public_props_.clear();
+        private_props_.clear();
+        payload_.clear();
+        return *this;
+    }
+
+    stream_encoder& timestamp(std::uint64_t ts) {
+        add_varint_property(property_id::timestamp, ts);
+        return *this;
+    }
+
+    stream_encoder& timestamp(media_time time) {
+        add_varint_property(property_id::timestamp, time.ticks);
+        add_varint_property(property_id::timescale, time.timescale);
+        return *this;
+    }
+
+    stream_encoder& timescale(std::uint64_t scale) {
+        add_varint_property(property_id::timescale, scale);
+        return *this;
+    }
+
+    stream_encoder& frame_marking(video_frame_marking fm) {
+        add_varint_property(property_id::video_frame_marking, fm.encode());
+        return *this;
+    }
+
+    stream_encoder& audio_level_info(audio_level al) {
+        add_varint_property(property_id::audio_level, al.encode());
+        return *this;
+    }
+
+    stream_encoder& add_public_varint(std::uint64_t id, std::uint64_t value) {
+        add_varint_property(id, value);
+        return *this;
+    }
+
+    stream_encoder& add_public_bytes(std::uint64_t id, byte_span data) {
+        public_props_.push_back(property::from_bytes(id, data));
+        return *this;
+    }
+
+    stream_encoder& add_private(property p) {
+        private_props_.push_back(std::move(p));
+        return *this;
+    }
+
+    stream_encoder& set_group(const group_info& info) {
+        add_varint_property(property_id::group_id, info.group_id);
+        add_varint_property(property_id::subgroup_id, info.subgroup_id);
+        add_varint_property(property_id::sequence_number, info.sequence);
+        add_varint_property(property_id::priority, info.priority);
+        if (info.delivery_timeout_ms) {
+            add_varint_property(property_id::delivery_timeout, *info.delivery_timeout_ms);
+        }
+        return *this;
+    }
+
+    stream_encoder& set_payload(byte_span data) {
+        payload_.assign(data.begin(), data.end());
+        return *this;
+    }
+
+    stream_encoder& set_payload(std::vector<byte> data) {
+        payload_ = std::move(data);
+        return *this;
+    }
+
+    struct encoded_result {
+        std::vector<byte> public_properties;
+        std::vector<byte> payload;
+        buffer_pool* pool{nullptr};
+
+        [[nodiscard]] byte_span public_view() const noexcept {
+            return {public_properties.data(), public_properties.size()};
+        }
+
+        [[nodiscard]] byte_span payload_view() const noexcept {
+            return {payload.data(), payload.size()};
+        }
+
+        void release() {
+            if (pool) {
+                pool->release(std::move(public_properties));
+                pool->release(std::move(payload));
+                pool = nullptr;
+            }
+        }
+
+        ~encoded_result() { release(); }
+        encoded_result() = default;
+        encoded_result(encoded_result&& other) noexcept
+            : public_properties(std::move(other.public_properties))
+            , payload(std::move(other.payload))
+            , pool(other.pool) {
+            other.pool = nullptr;
+        }
+        encoded_result& operator=(encoded_result&& other) noexcept {
+            if (this != &other) {
+                release();
+                public_properties = std::move(other.public_properties);
+                payload = std::move(other.payload);
+                pool = other.pool;
+                other.pool = nullptr;
+            }
+            return *this;
+        }
+        encoded_result(const encoded_result&) = delete;
+        encoded_result& operator=(const encoded_result&) = delete;
+    };
+
+    [[nodiscard]] encoded_result encode() {
+        encoded_result result;
+        result.pool = pool_;
+
+        result.public_properties = pool_ ? pool_->acquire() : std::vector<byte>{};
+        result.payload = pool_ ? pool_->acquire() : std::vector<byte>{};
+
+        encode_props_into(public_props_, result.public_properties);
+        encode_props_into(private_props_, result.payload);
+        result.payload.insert(result.payload.end(), payload_.begin(), payload_.end());
+
+        return result;
+    }
+
+    [[nodiscard]] expected<std::size_t> encode_public_into(mutable_byte_span out) const noexcept {
+        std::size_t offset = 0;
+        for (const auto& p : public_props_) {
+            auto result = encode_property<Policy>(p, out.subspan(offset));
+            if (!result) return result.error();
+            offset += *result;
+        }
+        return offset;
+    }
+
+    [[nodiscard]] std::size_t public_encoded_size() const noexcept {
+        std::size_t total = 0;
+        for (const auto& p : public_props_) {
+            total += encoded_property_size<Policy>(p);
+        }
+        return total;
+    }
+
+    [[nodiscard]] std::size_t payload_encoded_size() const noexcept {
+        std::size_t total = 0;
+        for (const auto& p : private_props_) {
+            total += encoded_property_size<Policy>(p);
+        }
+        return total + payload_.size();
+    }
+
+private:
+    void add_varint_property(std::uint64_t id, std::uint64_t value) {
+        public_props_.push_back(property::from_varint(id, value));
+    }
+
+    void encode_props_into(const std::vector<property>& props, std::vector<byte>& out) {
+        std::size_t total = 0;
+        for (const auto& p : props) {
+            total += encoded_property_size<Policy>(p);
+        }
+
+        auto start = out.size();
+        out.resize(start + total);
+
+        std::size_t offset = 0;
+        for (const auto& p : props) {
+            auto result = encode_property<Policy>(p, mutable_byte_span{out}.subspan(start + offset));
+            assert(result.has_value());
+            offset += *result;
+        }
+    }
+
+    std::vector<property> public_props_;
+    std::vector<property> private_props_;
+    std::vector<byte> payload_;
+    buffer_pool* pool_{nullptr};
+};
+
+// ============================================================================
+// Streaming Decoder (Incremental Parsing)
+// ============================================================================
+
+template <typename Policy = default_varint>
+class stream_decoder {
+public:
+    enum class state { need_header, have_header, complete, error };
+
+    stream_decoder() = default;
+
+    void reset() noexcept {
+        state_ = state::need_header;
+        error_ = errc::ok;
+        public_props_.clear();
+        private_props_.clear();
+        payload_data_ = {};
+        private_length_ = 0;
+    }
+
+    [[nodiscard]] state current_state() const noexcept { return state_; }
+    [[nodiscard]] errc last_error() const noexcept { return error_; }
+
+    expected<void> parse_public(byte_span public_data) noexcept {
+        auto result = decode_properties<Policy>(public_data, [this](const property_view& p) {
+            public_props_.push_back(p);
+            return true;
+        });
+        if (!result) {
+            state_ = state::error;
+            error_ = result.error();
+            return error_;
+        }
+        state_ = state::have_header;
+        return {};
+    }
+
+    expected<void> parse_payload(byte_span payload_with_private, std::size_t private_length) noexcept {
+        if (payload_with_private.size() < private_length) {
+            state_ = state::error;
+            error_ = errc::truncated;
+            return error_;
+        }
+
+        private_length_ = private_length;
+        auto private_data = payload_with_private.first(private_length);
+        payload_data_ = payload_with_private.subspan(private_length);
+
+        auto result = decode_properties<Policy>(private_data, [this](const property_view& p) {
+            private_props_.push_back(p);
+            return true;
+        });
+        if (!result) {
+            state_ = state::error;
+            error_ = result.error();
+            return error_;
+        }
+
+        state_ = state::complete;
+        return {};
+    }
+
+    [[nodiscard]] std::span<const property_view> public_properties() const noexcept {
+        return public_props_;
+    }
+
+    [[nodiscard]] std::span<const property_view> private_properties() const noexcept {
+        return private_props_;
+    }
+
+    [[nodiscard]] byte_span payload() const noexcept {
+        return payload_data_;
+    }
+
+    [[nodiscard]] std::optional<std::uint64_t> get_timestamp() const noexcept {
+        return get_varint_property(property_id::timestamp);
+    }
+
+    [[nodiscard]] std::optional<std::uint64_t> get_timescale() const noexcept {
+        return get_varint_property(property_id::timescale);
+    }
+
+    [[nodiscard]] std::optional<media_time> get_media_time() const noexcept {
+        auto ts = get_timestamp();
+        auto scale = get_timescale();
+        if (!ts) return std::nullopt;
+        return media_time{*ts, scale.value_or(1)};
+    }
+
+    [[nodiscard]] std::optional<video_frame_marking> get_frame_marking() const noexcept {
+        auto val = get_varint_property(property_id::video_frame_marking);
+        if (!val) return std::nullopt;
+        return video_frame_marking::decode(*val);
+    }
+
+    [[nodiscard]] std::optional<audio_level> get_audio_level() const noexcept {
+        auto val = get_varint_property(property_id::audio_level);
+        if (!val) return std::nullopt;
+        return audio_level::decode(*val);
+    }
+
+private:
+    [[nodiscard]] std::optional<std::uint64_t> get_varint_property(std::uint64_t id) const noexcept {
+        for (const auto& p : public_props_) {
+            if (p.id == id && p.is_varint()) {
+                if (auto val = p.template as_varint<Policy>(); val) {
+                    return *val;
+                }
+            }
+        }
+        return std::nullopt;
+    }
+
+    state state_{state::need_header};
+    errc error_{errc::ok};
+    std::vector<property_view> public_props_;
+    std::vector<property_view> private_props_;
+    byte_span payload_data_;
+    std::size_t private_length_{0};
+};
+
+// ============================================================================
+// Media Frame Helper
+// ============================================================================
+
+class media_frame {
+public:
+    enum class type { unknown, video, audio };
+
+    media_frame() = default;
+
+    static media_frame video(media_time time, video_frame_marking marking) {
+        media_frame f;
+        f.type_ = type::video;
+        f.time_ = time;
+        f.frame_marking_ = marking;
+        return f;
+    }
+
+    static media_frame audio(media_time time, audio_level level) {
+        media_frame f;
+        f.type_ = type::audio;
+        f.time_ = time;
+        f.audio_level_ = level;
+        return f;
+    }
+
+    media_frame& set_group(group_info info) {
+        group_ = info;
+        return *this;
+    }
+
+    media_frame& set_payload(byte_span data) {
+        payload_.assign(data.begin(), data.end());
+        return *this;
+    }
+
+    media_frame& set_payload(std::vector<byte> data) {
+        payload_ = std::move(data);
+        return *this;
+    }
+
+    [[nodiscard]] type frame_type() const noexcept { return type_; }
+    [[nodiscard]] media_time time() const noexcept { return time_; }
+    [[nodiscard]] std::optional<video_frame_marking> frame_marking() const noexcept { return frame_marking_; }
+    [[nodiscard]] std::optional<audio_level> audio_level_info() const noexcept { return audio_level_; }
+    [[nodiscard]] std::optional<group_info> group() const noexcept { return group_; }
+    [[nodiscard]] byte_span payload() const noexcept { return {payload_.data(), payload_.size()}; }
+
+    [[nodiscard]] bool is_keyframe() const noexcept {
+        return frame_marking_ && frame_marking_->independent;
+    }
+
+    template <typename Policy = default_varint>
+    [[nodiscard]] loc_object to_loc_object() const {
+        loc_object obj;
+
+        obj.timestamp(time_.ticks);
+        obj.timescale(time_.timescale);
+
+        if (frame_marking_) {
+            obj.frame_marking(*frame_marking_);
+        }
+        if (audio_level_) {
+            obj.audio_level_info(*audio_level_);
+        }
+
+        if (group_) {
+            obj.add_public(property::from_varint(property_id::group_id, group_->group_id));
+            obj.add_public(property::from_varint(property_id::subgroup_id, group_->subgroup_id));
+            obj.add_public(property::from_varint(property_id::sequence_number, group_->sequence));
+            obj.add_public(property::from_varint(property_id::priority, group_->priority));
+            if (group_->delivery_timeout_ms) {
+                obj.add_public(property::from_varint(property_id::delivery_timeout, *group_->delivery_timeout_ms));
+            }
+        }
+
+        obj.set_payload(byte_span{payload_.data(), payload_.size()});
+        return obj;
+    }
+
+private:
+    type type_{type::unknown};
+    media_time time_;
+    std::optional<video_frame_marking> frame_marking_;
+    std::optional<audio_level> audio_level_;
+    std::optional<group_info> group_;
+    std::vector<byte> payload_;
+};
 
 }  // namespace loc

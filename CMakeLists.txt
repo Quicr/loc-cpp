@@ -89,7 +89,8 @@ if(LOC_BUILD_TESTS)
     tests/test_main.cpp
     tests/varint_tests.cpp
     tests/property_tests.cpp
-    tests/object_tests.cpp)
+    tests/object_tests.cpp
+    tests/stream_tests.cpp)
   target_link_libraries(loc_unit_tests PRIVATE loc::loc loc_doctest)
   add_test(NAME loc_unit_tests COMMAND loc_unit_tests)
 
