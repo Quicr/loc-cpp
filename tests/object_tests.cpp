@@ -71,8 +71,9 @@ TEST_CASE("loc_object with audio level") {
     REQUIRE(level_val.has_value());
 
     auto level = loc::audio_level::decode(*level_val);
-    CHECK_EQ(level.level, 42);
-    CHECK(level.voice_activity);
+    REQUIRE(level.has_value());
+    CHECK_EQ(level->level, 42);
+    CHECK(level->voice_activity);
 }
 
 TEST_CASE("decode_loc_object handles truncated input") {

@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cassert>
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
@@ -68,16 +69,40 @@ public:
     [[nodiscard]] constexpr explicit operator bool() const noexcept { return error_ == errc::ok; }
     [[nodiscard]] constexpr bool has_value() const noexcept { return error_ == errc::ok; }
 
-    [[nodiscard]] constexpr T& operator*() & noexcept { return value_; }
-    [[nodiscard]] constexpr const T& operator*() const& noexcept { return value_; }
-    [[nodiscard]] constexpr T&& operator*() && noexcept { return std::move(value_); }
+    [[nodiscard]] constexpr T& operator*() & noexcept {
+        assert(has_value() && "dereferencing expected in error state");
+        return value_;
+    }
+    [[nodiscard]] constexpr const T& operator*() const& noexcept {
+        assert(has_value() && "dereferencing expected in error state");
+        return value_;
+    }
+    [[nodiscard]] constexpr T&& operator*() && noexcept {
+        assert(has_value() && "dereferencing expected in error state");
+        return std::move(value_);
+    }
 
-    [[nodiscard]] constexpr T* operator->() noexcept { return &value_; }
-    [[nodiscard]] constexpr const T* operator->() const noexcept { return &value_; }
+    [[nodiscard]] constexpr T* operator->() noexcept {
+        assert(has_value() && "dereferencing expected in error state");
+        return &value_;
+    }
+    [[nodiscard]] constexpr const T* operator->() const noexcept {
+        assert(has_value() && "dereferencing expected in error state");
+        return &value_;
+    }
 
-    [[nodiscard]] constexpr T& value() & noexcept { return value_; }
-    [[nodiscard]] constexpr const T& value() const& noexcept { return value_; }
-    [[nodiscard]] constexpr T&& value() && noexcept { return std::move(value_); }
+    [[nodiscard]] constexpr T& value() & noexcept {
+        assert(has_value() && "accessing value of expected in error state");
+        return value_;
+    }
+    [[nodiscard]] constexpr const T& value() const& noexcept {
+        assert(has_value() && "accessing value of expected in error state");
+        return value_;
+    }
+    [[nodiscard]] constexpr T&& value() && noexcept {
+        assert(has_value() && "accessing value of expected in error state");
+        return std::move(value_);
+    }
 
     [[nodiscard]] constexpr errc error() const noexcept { return error_; }
 
@@ -192,15 +217,20 @@ struct moq_varint {
 
         for (std::size_t i = 0; i < in.size(); ++i) {
             const auto b = std::to_integer<std::uint8_t>(in[i]);
-            if (shift >= 64 && (b & 0x7F) != 0) return errc::overflow;
-            v |= static_cast<std::uint64_t>(b & 0x7F) << shift;
+            const auto payload = static_cast<std::uint64_t>(b & 0x7F);
+
+            // Check for overflow before shifting: at shift=63, only bit 0 can be set
+            if (shift >= 63 && payload > 1) return errc::overflow;
+
+            v |= payload << shift;
 
             if ((b & 0x80) == 0) {
                 if (encoded_size(v) != i + 1) return errc::non_minimal;
                 return std::pair{v, i + 1};
             }
             shift += 7;
-            if (shift > 63) return errc::invalid_encoding;
+            // 10 bytes max for 64-bit value (ceil(64/7) = 10)
+            if (i >= 9) return errc::invalid_encoding;
         }
         return errc::truncated;
     }
@@ -267,7 +297,10 @@ public:
     [[nodiscard]] constexpr std::size_t size() const noexcept { return data_.size(); }
     [[nodiscard]] constexpr bool empty() const noexcept { return data_.empty(); }
 
-    constexpr void advance(std::size_t n) noexcept { data_ = data_.subspan(n); }
+    constexpr void advance(std::size_t n) noexcept {
+        assert(n <= data_.size() && "advance beyond end of cursor");
+        data_ = data_.subspan(n);
+    }
 
     template <typename Policy = default_varint>
     [[nodiscard]] constexpr expected<std::uint64_t> read_varint() noexcept {
@@ -334,6 +367,7 @@ public:
 
         std::array<byte, default_varint::max_size> buf{};
         auto result = default_varint::encode(value, buf);
+        assert(result.has_value() && "varint encoding failed");
         p.size_ = *result;
         if (p.size_ <= sbo_size) {
             std::copy_n(buf.begin(), p.size_, p.storage_.inline_data.begin());
@@ -492,6 +526,7 @@ template <typename Policy = default_varint>
     std::size_t offset = 0;
     for (const auto& p : props) {
         auto result = encode_property<Policy>(p, mutable_byte_span{out}.subspan(offset));
+        assert(result.has_value() && "property encoding failed");
         offset += *result;
     }
     return out;
@@ -557,8 +592,10 @@ struct video_frame_marking {
                (static_cast<std::uint64_t>(spatial_id & 7) << 6);
     }
 
-    [[nodiscard]] static constexpr video_frame_marking decode(std::uint64_t v) noexcept {
-        return {
+    [[nodiscard]] static constexpr std::optional<video_frame_marking> decode(std::uint64_t v) noexcept {
+        // Only bits 0-8 are valid (3 flags + 3-bit temporal_id + 3-bit spatial_id)
+        if (v & ~0x1FFULL) return std::nullopt;
+        return video_frame_marking{
             .independent = (v & 1) != 0,
             .discardable = (v & 2) != 0,
             .base_layer_sync = (v & 4) != 0,
@@ -581,8 +618,10 @@ struct audio_level {
                (voice_activity ? 0x80ULL : 0);
     }
 
-    [[nodiscard]] static constexpr audio_level decode(std::uint64_t v) noexcept {
-        return {
+    [[nodiscard]] static constexpr std::optional<audio_level> decode(std::uint64_t v) noexcept {
+        // Only bits 0-7 are valid (7-bit level + 1-bit voice_activity)
+        if (v & ~0xFFULL) return std::nullopt;
+        return audio_level{
             .level = static_cast<std::uint8_t>(v & 0x7F),
             .voice_activity = (v & 0x80) != 0
         };

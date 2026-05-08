@@ -56,11 +56,12 @@ TEST_CASE("integration roundtrip for video object") {
     auto decoded_marking_val = (*decoded_public)[2].as_varint();
     REQUIRE(decoded_marking_val.has_value());
     auto parsed = loc::video_frame_marking::decode(*decoded_marking_val);
-    CHECK(parsed.independent);
-    CHECK(parsed.discardable);
-    CHECK(parsed.base_layer_sync);
-    CHECK_EQ(parsed.temporal_id, 2);
-    CHECK_EQ(parsed.spatial_id, 1);
+    REQUIRE(parsed.has_value());
+    CHECK(parsed->independent);
+    CHECK(parsed->discardable);
+    CHECK(parsed->base_layer_sync);
+    CHECK_EQ(parsed->temporal_id, 2);
+    CHECK_EQ(parsed->spatial_id, 1);
 }
 
 TEST_CASE("integration roundtrip for audio object") {
@@ -86,8 +87,9 @@ TEST_CASE("integration roundtrip for audio object") {
     REQUIRE(level_val.has_value());
 
     auto parsed = loc::audio_level::decode(*level_val);
-    CHECK_EQ(parsed.level, 63);
-    CHECK(parsed.voice_activity);
+    REQUIRE(parsed.has_value());
+    CHECK_EQ(parsed->level, 63);
+    CHECK(parsed->voice_activity);
 }
 
 TEST_CASE("empty object roundtrip") {
