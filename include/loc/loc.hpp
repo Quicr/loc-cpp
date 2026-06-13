@@ -213,51 +213,68 @@ struct quic_varint {
     }
 };
 
+// MoQ Transport draft-18 Section 1.4.1 variable-length integer encoding.
+// Leading 1-bits in the first byte indicate encoding length; value is big-endian.
 struct moq_varint {
     static constexpr std::uint64_t max_value = std::numeric_limits<std::uint64_t>::max();
-    static constexpr std::size_t max_size = 10;
+    static constexpr std::size_t max_size = 9;
 
     [[nodiscard]] static constexpr std::size_t encoded_size(std::uint64_t v) noexcept {
-        std::size_t size = 1;
-        while (v >= 0x80) { v >>= 7; ++size; }
-        return size;
+        if (v <= 0x7FULL) return 1;
+        if (v <= 0x3FFFULL) return 2;
+        if (v <= 0x1FFFFFULL) return 3;
+        if (v <= 0xFFFFFFFULL) return 4;
+        if (v <= 0x7FFFFFFFFULL) return 5;
+        if (v <= 0x3FFFFFFFFFFULL) return 6;
+        if (v <= 0x1FFFFFFFFFFFFULL) return 7;
+        if (v <= 0xFFFFFFFFFFFFFFULL) return 8;
+        return 9;
     }
 
     [[nodiscard]] static constexpr expected<std::size_t> encode(std::uint64_t v, mutable_byte_span out) noexcept {
         const auto size = encoded_size(v);
         if (out.size() < size) return errc::truncated;
 
-        for (std::size_t i = 0; i < size; ++i) {
-            auto b = static_cast<std::uint8_t>(v & 0x7F);
-            v >>= 7;
-            if (i + 1 < size) b |= 0x80;
-            out[i] = static_cast<byte>(b);
+        if (size == 9) {
+            out[0] = static_cast<byte>(0xFF);
+            for (std::size_t i = 1; i <= 8; ++i) {
+                out[i] = static_cast<byte>((v >> ((8 - i) * 8)) & 0xFF);
+            }
+        } else {
+            for (std::size_t i = size; i-- > 0;) {
+                out[i] = static_cast<byte>(v & 0xFF);
+                v >>= 8;
+            }
+            constexpr std::uint8_t prefix[] = {0x00, 0x00, 0x80, 0xC0, 0xE0, 0xF0, 0xF8, 0xFC, 0xFE};
+            out[0] = static_cast<byte>(std::to_integer<std::uint8_t>(out[0]) | prefix[size]);
         }
         return size;
     }
 
     [[nodiscard]] static constexpr expected<std::pair<std::uint64_t, std::size_t>> decode(byte_span in) noexcept {
-        std::uint64_t v = 0;
-        std::size_t shift = 0;
+        if (in.empty()) return errc::truncated;
 
-        for (std::size_t i = 0; i < in.size(); ++i) {
-            const auto b = std::to_integer<std::uint8_t>(in[i]);
-            const auto payload = static_cast<std::uint64_t>(b & 0x7F);
+        const auto first = std::to_integer<std::uint8_t>(in[0]);
+        const auto leading_ones = static_cast<std::size_t>(std::countl_one(first));
+        const std::size_t size = (leading_ones < 8) ? leading_ones + 1 : 9;
 
-            // Check for overflow before shifting: at shift=63, only bit 0 can be set
-            if (shift >= 63 && payload > 1) return errc::overflow;
+        if (in.size() < size) return errc::truncated;
 
-            v |= payload << shift;
-
-            if ((b & 0x80) == 0) {
-                if (encoded_size(v) != i + 1) return errc::non_minimal;
-                return std::pair{v, i + 1};
+        std::uint64_t v;
+        if (size == 9) {
+            v = 0;
+            for (std::size_t i = 1; i <= 8; ++i) {
+                v = (v << 8) | std::to_integer<std::uint8_t>(in[i]);
             }
-            shift += 7;
-            // 10 bytes max for 64-bit value (ceil(64/7) = 10)
-            if (i >= 9) return errc::invalid_encoding;
+        } else {
+            // Mask off prefix bits from first byte
+            v = first & static_cast<std::uint8_t>(0xFF >> size);
+            for (std::size_t i = 1; i < size; ++i) {
+                v = (v << 8) | std::to_integer<std::uint8_t>(in[i]);
+            }
         }
-        return errc::truncated;
+
+        return std::pair{v, size};
     }
 };
 

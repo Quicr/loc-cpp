@@ -64,9 +64,62 @@ TEST_CASE("moq varint encoding") {
     SUBCASE("two byte values for 128") {
         auto encoded = loc::encode_varint<loc::moq_varint>(128);
         REQUIRE_EQ(encoded.size(), 2U);
+        // prefix 10 + 14-bit value: 10_000000 10000000
         CHECK_EQ(std::to_integer<std::uint8_t>(encoded[0]), 0x80U);
-        CHECK_EQ(std::to_integer<std::uint8_t>(encoded[1]), 0x01U);
+        CHECK_EQ(std::to_integer<std::uint8_t>(encoded[1]), 0x80U);
     }
+
+    SUBCASE("two byte values for 15293") {
+        auto encoded = loc::encode_varint<loc::moq_varint>(15'293);
+        REQUIRE_EQ(encoded.size(), 2U);
+        CHECK_EQ(std::to_integer<std::uint8_t>(encoded[0]), 0xBBU);
+        CHECK_EQ(std::to_integer<std::uint8_t>(encoded[1]), 0xBDU);
+    }
+
+    SUBCASE("four byte values for 226442877") {
+        auto encoded = loc::encode_varint<loc::moq_varint>(226'442'877);
+        REQUIRE_EQ(encoded.size(), 4U);
+        CHECK_EQ(std::to_integer<std::uint8_t>(encoded[0]), 0xEDU);
+        CHECK_EQ(std::to_integer<std::uint8_t>(encoded[1]), 0x7FU);
+        CHECK_EQ(std::to_integer<std::uint8_t>(encoded[2]), 0x3EU);
+        CHECK_EQ(std::to_integer<std::uint8_t>(encoded[3]), 0x7DU);
+    }
+
+    SUBCASE("nine byte max value") {
+        auto encoded = loc::encode_varint<loc::moq_varint>(UINT64_MAX);
+        REQUIRE_EQ(encoded.size(), 9U);
+        CHECK_EQ(std::to_integer<std::uint8_t>(encoded[0]), 0xFFU);
+        for (std::size_t i = 1; i <= 8; ++i) {
+            CHECK_EQ(std::to_integer<std::uint8_t>(encoded[i]), 0xFFU);
+        }
+    }
+}
+
+TEST_CASE("moq varint roundtrip") {
+    constexpr std::array<std::uint64_t, 12> values{
+        0, 1, 37, 127, 128, 15'293, 16'383, 16'384,
+        226'442'877, 268'435'455, 268'435'456, UINT64_MAX,
+    };
+
+    for (const auto value : values) {
+        auto encoded = loc::encode_varint<loc::moq_varint>(value);
+        loc::byte_span span{encoded.data(), encoded.size()};
+        auto decoded = loc::decode_varint<loc::moq_varint>(span);
+        REQUIRE(decoded.has_value());
+        CHECK_EQ(*decoded, value);
+        CHECK(span.empty());
+    }
+}
+
+TEST_CASE("moq varint accepts non-minimal encodings") {
+    // draft-18: "any encoding length that can represent the value is valid"
+    // 0x8025 encodes 37 in 2 bytes (non-minimal, since 37 fits in 1 byte)
+    std::array data{std::byte{0x80}, std::byte{0x25}};
+    loc::byte_span span{data.data(), data.size()};
+    auto decoded = loc::decode_varint<loc::moq_varint>(span);
+    REQUIRE(decoded.has_value());
+    CHECK_EQ(*decoded, 37U);
+    CHECK(span.empty());
 }
 
 TEST_CASE("varint rejects non-minimal encodings") {
@@ -78,12 +131,13 @@ TEST_CASE("varint rejects non-minimal encodings") {
         CHECK_EQ(decoded.error(), loc::errc::non_minimal);
     }
 
-    SUBCASE("moq varint") {
+    SUBCASE("moq varint allows non-minimal") {
+        // draft-18 permits non-minimal encodings
         std::array data{std::byte{0x80}, std::byte{0x00}};
         loc::byte_span span{data.data(), data.size()};
         auto decoded = loc::decode_varint<loc::moq_varint>(span);
-        CHECK_FALSE(decoded.has_value());
-        CHECK_EQ(decoded.error(), loc::errc::non_minimal);
+        CHECK(decoded.has_value());
+        CHECK_EQ(*decoded, 0U);
     }
 }
 
